@@ -1,3 +1,4 @@
 streamlit
 pandas
-st-gsheets
+st-gsheets-connection
+fugle-market
