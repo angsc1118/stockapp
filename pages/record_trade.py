@@ -7,13 +7,14 @@
 
 # 修改歷程
 # 2025-11-24 16:05: 建立交易紀錄頁面，實作輸入表單、自動計算金額與寫入 Google Sheet 功能。
+# 2025-11-24 16:20: 確認 secrets.toml 結構後，優化連線錯誤處理提示，確保對應 [connections.gsheets] 設定。
 
 import streamlit as st
 import pandas as pd
 from datetime import datetime
 from streamlit_gsheets import GSheetsConnection
 
-# 設定頁面配置 (若主程式已有設定，這行可視情況移除)
+# 設定頁面配置
 st.set_page_config(page_title="交易紀錄", page_icon="📝")
 
 def calculate_amounts(price, quantity, action, fee_rate=0.001425, tax_rate=0.003, discount=0.6):
@@ -31,14 +32,16 @@ def calculate_amounts(price, quantity, action, fee_rate=0.001425, tax_rate=0.003
     Returns:
         tuple: (手續費, 交易稅, 總金額)
     """
-    # 基礎手續費計算 (未滿 20 元以 20 元計，這是台股常見規則，這裡先做簡單計算，可依需求調整)
+    # 基礎手續費計算
     raw_fee = price * quantity * fee_rate * discount
-    fee = max(int(raw_fee), 20) # 假設最低手續費 20
+    # 台股最低手續費通常為 20 元
+    fee = max(int(raw_fee), 20)
     
     tax = 0
     total_amount = 0
     
     if action == "賣出":
+        # 賣出時需支付交易稅
         tax = int(price * quantity * tax_rate)
         # 賣出收入 = 價金 - 手續費 - 交易稅
         total_amount = int(price * quantity - fee - tax)
@@ -53,14 +56,17 @@ def main():
     st.markdown("---")
 
     # 建立與 Google Sheets 的連線
-    # 使用 st.connection 快取連線物件
+    # 這裡會自動讀取 secrets.toml 中 [connections.gsheets] 的設定
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
     except Exception as e:
-        st.error(f"無法連接 Google Sheets，請檢查 secrets.toml 設定。\n錯誤訊息: {e}")
+        st.error("無法連接 Google Sheets。")
+        st.info("請檢查 .streamlit/secrets.toml 是否包含 [connections.gsheets] 區塊，並確認 Service Account 權限。")
+        st.expander("錯誤詳細資訊").write(e)
         return
 
     # --- 輸入表單區域 ---
+    # 使用 st.form 避免每次輸入都重新整理頁面
     with st.form("trade_input_form", clear_on_submit=False):
         st.subheader("新增交易資料")
         
@@ -76,18 +82,15 @@ def main():
             trade_time = st.time_input("交易時間", datetime.now())
             stock_name = st.text_input("股票名稱", placeholder="例如: 台積電")
             quantity = st.number_input("成交股數", min_value=1, step=1000, value=1000)
-            # 預設手續費折數與稅率，可讓使用者微調
+            # 預設手續費折數，可依券商設定調整
             fee_discount = st.number_input("手續費折數 (例如 0.6)", min_value=0.0, max_value=1.0, value=0.6, step=0.05)
 
         note = st.text_area("策略 / 筆記", placeholder="紀錄進出場理由...")
 
-        # 自動試算顯示 (這部分在 Form 裡面不會即時更新，若要即時更新需移出 Form 或使用 st.session_state)
-        # 為了簡化 MVP，我們在按下提交時進行最終計算與確認
-        
         submitted = st.form_submit_button("💾 儲存交易紀錄")
 
     if submitted:
-        # 1. 驗證資料
+        # 1. 簡單資料驗證
         if not stock_code or not stock_name:
             st.warning("請填寫完整的股票代號與名稱。")
             return
@@ -104,8 +107,7 @@ def main():
             discount=fee_discount
         )
 
-        # 3. 準備寫入的資料
-        # 格式化時間字串
+        # 3. 準備寫入的資料 DataFrame
         timestamp_str = datetime.combine(trade_date, trade_time).strftime("%Y-%m-%d %H:%M:%S")
         date_str = trade_date.strftime("%Y-%m-%d")
 
@@ -126,17 +128,19 @@ def main():
         ])
 
         # 4. 寫入 Google Sheets
-        # 注意: st-gsheets 的 read() 預設會讀取第一張工作表，若指定 worksheet 需確認名稱
-        # 這裡假設工作表名稱為 'trade_log'，若不存在建議先在 Sheet 中建立
+        # 設定目標工作表名稱，請確保 Google Sheet 中有此分頁
         target_worksheet = "trade_log" 
         
         try:
             with st.spinner("正在寫入資料庫..."):
-                # 讀取現有資料
-                existing_data = conn.read(worksheet=target_worksheet, usecols=list(new_data.columns), ttl=0)
-                
-                # 合併新舊資料
-                updated_data = pd.concat([existing_data, new_data], ignore_index=True)
+                # 讀取現有資料 (ttl=0 表示不快取，確保讀到最新)
+                # 若工作表是空的或不存在，read() 可能會拋出錯誤，需視情況處理
+                try:
+                    existing_data = conn.read(worksheet=target_worksheet, usecols=list(new_data.columns), ttl=0)
+                    updated_data = pd.concat([existing_data, new_data], ignore_index=True)
+                except Exception:
+                    # 若讀取失敗(例如空表)，則直接使用新資料
+                    updated_data = new_data
                 
                 # 寫回 Google Sheets
                 conn.update(worksheet=target_worksheet, data=updated_data)
@@ -150,7 +154,7 @@ def main():
 
         except Exception as e:
             st.error(f"寫入資料失敗: {e}")
-            st.markdown("請確認 Google Sheet 中是否存在名為 `trade_log` 的工作表。")
+            st.markdown(f"請確認 Google Sheet 中是否存在名為 `{target_worksheet}` 的工作表，且 Service Account 有編輯權限。")
 
 if __name__ == "__main__":
     main()
